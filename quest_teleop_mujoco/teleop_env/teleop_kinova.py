@@ -152,6 +152,10 @@ def main() -> None:
     latest_gripper_cmd = None
 
     with viewer.launch_passive(model, data) as vis:
+        vis.cam.azimuth = model.vis.global_.azimuth
+        vis.cam.elevation = model.vis.global_.elevation
+        vis.cam.distance = model.stat.extent * 1.5
+        vis.cam.lookat[:] = model.stat.center
         while vis.is_running():
             try:
                 packet, _ = sock.recvfrom(1024)
