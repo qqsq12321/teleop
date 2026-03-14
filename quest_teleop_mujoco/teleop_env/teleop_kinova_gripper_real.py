@@ -1,12 +1,12 @@
-"""Teleoperate a real Kinova Gen3 arm + real Wuji Hand via Quest 3 hand tracking.
+"""Teleoperate a real Kinova Gen3 arm + Robotiq 2F-85 gripper via Quest 3 hand tracking.
 
 Design:
 - Quest wrist pose -> residual target pose -> MuJoCo IK -> Kinova joint-speed commands
-- Quest 21 landmarks -> retargeting -> Wuji Hand 20 joint targets
+- Quest pinch distance -> Kortex gripper position command
 - MuJoCo is used only as a kinematic / IK model, not as a simulator
 
 Example:
-    python teleop_env/teleop_kinova_wuji_real.py --port 9000 --kinova-ip 192.168.1.10
+    python teleop_env/teleop_kinova_gripper_real.py --port 9000 --kinova-ip 192.168.1.10
 """
 
 from __future__ import annotations
@@ -27,8 +27,6 @@ from types import SimpleNamespace
 import mujoco
 import numpy as np
 
-from wuji_retargeting import Retargeter
-
 from util.ik import solve_pose_ik
 from util.quaternion import (
     matrix_to_quaternion,
@@ -38,16 +36,10 @@ from util.quaternion import (
     transform_vr_to_robot_pose,
 )
 from util.udp_socket import (
-    parse_left_landmarks,
-    parse_left_wrist_pose,
     parse_right_landmarks,
     parse_right_wrist_pose,
+    pinch_distance_from_landmarks,
 )
-
-try:
-    import wujihandpy
-except ImportError:  # pragma: no cover - depends on local hardware env
-    wujihandpy = None
 
 _KORTEX_EXAMPLES_DIR = (
     _Path(__file__).resolve().parents[1]
@@ -63,16 +55,18 @@ from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient  # noqa: E4
 from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient  # noqa: E402
 from kortex_api.autogen.messages import Base_pb2  # noqa: E402
 
-# Gen3 home pose used only as an IK regularization prior.
-_HOME_QPOS = np.array(
-    [0.0, 0.26179939, 3.14159265, -2.26892803, 0.0, 0.95993109, 1.57079633],
+# Gen3 initial pose (7 arm joints) used as IK prior and startup target.
+_INIT_QPOS = np.array(
+    [0.0, 0.585, 3.14, -1.6, 0.0, -0.861, 1.57],
     dtype=np.float64,
 )
 
 _NUM_ARM_JOINTS = 7
-_NUM_HAND_JOINTS = 20
 
-# Fixed Kinova teleop gains/limits (kept internal, not exposed as CLI flags).
+# Pinch distance normalization (meters)
+_PINCH_MAX_DISTANCE = 0.1
+
+# Fixed Kinova teleop gains/limits.
 _POSITION_SCALE = 1.0
 _WRIST_POS_DEADBAND = 0.03
 _ARM_KP = 2.0
@@ -87,49 +81,17 @@ _CONTROL_PERIOD_S = 0.02
 _PACKET_TIMEOUT_S = 0.25
 _HOME_TIMEOUT_S = 30.0
 _DEFAULT_SITE = "kinova_ee_site"
-_HAND_CUTOFF_FREQ = 5.0
-
-# Unity LH (x right, y up, z forward) -> RH (x front, y left, z up)
-_UNITY_TO_RH = np.array(
-    [[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-    dtype=float,
-)
-
-
-def _landmarks_to_mediapipe(raw_landmarks: list[float]) -> np.ndarray:
-    arr = np.array(raw_landmarks, dtype=np.float64).reshape(21, 3)
-    return (_UNITY_TO_RH @ arr.T).T
 
 
 def _default_scene_path() -> Path:
-    return Path(__file__).resolve().parent / "scene" / "scene_kinova_gen3_wuji.xml"
-
-
-def _default_arm_scene_path() -> Path:
     return Path(__file__).resolve().parent / "scene" / "scene_kinova_gen3.xml"
-
-
-def _default_hand_config_path() -> Path:
-    return (
-        _Path(__file__).resolve().parents[1]
-        / ".."
-        / "wuji-retargeting"
-        / "example"
-        / "config"
-        / "adaptive_analytical_quest3.yaml"
-    )
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Teleop real Kinova Gen3 + Wuji Hand with Quest wrist residuals + retargeting."
+        description="Teleop real Kinova Gen3 + Robotiq gripper with Quest wrist residuals + pinch."
     )
     parser.add_argument("--port", type=int, default=9000, help="UDP port to listen on.")
-    parser.add_argument(
-        "--hand-config",
-        default=None,
-        help="Path to retargeter YAML config. Default: auto-detect.",
-    )
     parser.add_argument(
         "--kinova-ip",
         default="192.168.1.10",
@@ -146,16 +108,47 @@ def _parse_args() -> argparse.Namespace:
         help="Kinova password.",
     )
     parser.add_argument(
-        "--disable-arm",
-        action="store_true",
-        help="Do not send commands to Kinova arm.",
+        "--position-scale",
+        type=float,
+        default=_POSITION_SCALE,
+        help="Scale for wrist position residuals.",
     )
     parser.add_argument(
-        "--disable-hand",
-        action="store_true",
-        help="Do not send commands to Wuji hand.",
+        "--ema-alpha",
+        type=float,
+        default=_EMA_ALPHA,
+        help="EMA smoothing factor for wrist residuals (0-1).",
+    )
+    parser.add_argument(
+        "--rot-weight",
+        type=float,
+        default=_ROT_WEIGHT,
+        help="Weight for orientation error in IK.",
+    )
+    parser.add_argument(
+        "--ik-damping",
+        type=float,
+        default=_IK_DAMPING,
+        help="Damping factor for IK solver.",
+    )
+    parser.add_argument(
+        "--ik-current-weight",
+        type=float,
+        default=_IK_CURRENT_WEIGHT,
+        help="Weight for penalizing deviation from current pose in IK.",
     )
     return parser.parse_args()
+
+
+def _pinch_to_gripper_position(pinch_distance: float) -> float:
+    """Map pinch distance to Kortex gripper position (0.0=open, 1.0=closed).
+
+    Small distance (pinched) -> large value (closed).
+    Large distance (open hand) -> small value (open).
+    """
+    scaled = pinch_distance / _PINCH_MAX_DISTANCE
+    clamped = min(1.0, max(0.0, scaled))
+    return 1.0 - clamped
 
 
 def _angle_error_deg(target_deg: np.ndarray, current_deg: np.ndarray) -> np.ndarray:
@@ -180,49 +173,12 @@ def _make_socket(port: int) -> socket.socket:
     return sock
 
 
-def _make_hand_controller(args: argparse.Namespace):
-    if args.disable_hand:
-        return None, None
-    if wujihandpy is None:
-        raise ImportError(
-            "wujihandpy is not installed, but Wuji hand control is enabled. "
-            "Install it or pass --disable-hand."
-        )
-    hand = wujihandpy.Hand()
-    hand.write_joint_enabled(True)
-    controller = hand.realtime_controller(
-        enable_upstream=False,
-        filter=wujihandpy.filter.LowPass(cutoff_freq=_HAND_CUTOFF_FREQ),
-    )
-    time.sleep(0.5)
-    return hand, controller
-
-
-def _load_retargeter(args: argparse.Namespace) -> Retargeter | None:
-    if args.disable_hand:
-        return None
-    hand_config = args.hand_config
-    if hand_config is None:
-        default_cfg = _default_hand_config_path()
-        if default_cfg.exists():
-            hand_config = str(default_cfg)
-        else:
-            print(f"Warning: default hand config not found at {default_cfg}")
-            print("Hand retargeting will be disabled. Use --hand-config to specify.")
-            return None
-    retargeter = Retargeter.from_yaml(str(hand_config), "right")
-    print(f"Retargeter loaded from {hand_config}")
-    return retargeter
-
-
 def _get_measured_q_rad(base_cyclic: BaseCyclicClient) -> np.ndarray:
     feedback = base_cyclic.RefreshFeedback()
     q_deg = np.array(
         [feedback.actuators[i].position for i in range(_NUM_ARM_JOINTS)],
         dtype=np.float64,
     )
-    # Kinova often reports angles in [0, 360). Convert to signed degrees so they
-    # match the MuJoCo joint convention expected by the kinematic model / IK.
     q_deg = np.where(q_deg > 180.0, q_deg - 360.0, q_deg)
     return np.deg2rad(q_deg)
 
@@ -240,8 +196,23 @@ def _build_joint_speeds_command(speed_deg_s: np.ndarray):
 def _stop_arm(base: BaseClient) -> None:
     try:
         base.Stop()
-    except Exception as exc:  # pragma: no cover - hardware dependent
+    except Exception as exc:
         print(f"Warning: failed to stop Kinova arm cleanly: {exc}")
+
+
+def _send_gripper_command(base: BaseClient, position: float) -> None:
+    """Send gripper position command via Kortex high-level API.
+
+    Args:
+        base: Kortex BaseClient.
+        position: Gripper target position, 0.0 (open) to 1.0 (closed).
+    """
+    gripper_command = Base_pb2.GripperCommand()
+    gripper_command.mode = Base_pb2.GRIPPER_POSITION
+    finger = gripper_command.gripper.finger.add()
+    finger.finger_identifier = 0
+    finger.value = float(position)
+    base.SendGripperCommand(gripper_command)
 
 
 def _apply_position_deadband(vec: np.ndarray, deadband: float) -> np.ndarray:
@@ -313,13 +284,43 @@ def _move_arm_home(base: BaseClient, timeout: float = 30.0) -> bool:
         base.Unsubscribe(notification_handle)
 
 
+def _move_to_init_qpos(
+    base: BaseClient,
+    base_cyclic: BaseCyclicClient,
+    timeout: float = 15.0,
+    kp: float = 2.0,
+    max_speed: float = 30.0,
+    threshold_deg: float = 1.0,
+    dt: float = 0.02,
+) -> None:
+    """Drive arm from current pose to _INIT_QPOS using joint speed commands."""
+    target_deg = np.rad2deg(_INIT_QPOS)
+    print(f"Moving to _INIT_QPOS (deg): {target_deg.tolist()}")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        current_rad = _get_measured_q_rad(base_cyclic)
+        current_deg = np.rad2deg(current_rad)
+        err_deg = _angle_error_deg(target_deg, current_deg)
+        if np.all(np.abs(err_deg) < threshold_deg):
+            print("Reached _INIT_QPOS.")
+            base.SendJointSpeedsCommand(
+                _build_joint_speeds_command(np.zeros(_NUM_ARM_JOINTS, dtype=np.float64))
+            )
+            return
+        speed_deg_s = np.clip(kp * err_deg, -max_speed, max_speed)
+        speed_deg_s[np.abs(err_deg) < _ARM_DEADBAND_DEG] = 0.0
+        base.SendJointSpeedsCommand(_build_joint_speeds_command(speed_deg_s))
+        time.sleep(dt)
+    print("Warning: timeout moving to _INIT_QPOS.")
+    base.SendJointSpeedsCommand(
+        _build_joint_speeds_command(np.zeros(_NUM_ARM_JOINTS, dtype=np.float64))
+    )
+
+
 def main() -> None:
     args = _parse_args()
 
     xml_path = _default_scene_path().resolve()
-    if args.disable_hand:
-        xml_path = _default_arm_scene_path().resolve()
-        print(f"Arm-only mode: using arm scene {xml_path}")
     model = mujoco.MjModel.from_xml_path(str(xml_path))
     state_data = mujoco.MjData(model)
     ik_data = mujoco.MjData(model)
@@ -330,20 +331,12 @@ def main() -> None:
     base_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
 
     sock = _make_socket(args.port)
-    retargeter = _load_retargeter(args)
-    parse_landmarks, parse_wrist_pose = parse_right_landmarks, parse_right_wrist_pose
-
-    hand = None
-    hand_controller = None
 
     kinova_args = SimpleNamespace(
         ip=args.kinova_ip,
         username=args.kinova_username,
         password=args.kinova_password,
     )
-
-    if args.disable_arm:
-        raise ValueError("This script currently requires Kinova arm feedback for IK. Remove --disable-arm.")
 
     with kortex_utilities.DeviceConnection.createTcpConnection(kinova_args) as router, \
          kortex_utilities.DeviceConnection.createUdpConnection(kinova_args) as router_rt:
@@ -354,7 +347,7 @@ def main() -> None:
         servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
         base.SetServoingMode(servo_mode)
 
-        _move_arm_home(base, timeout=_HOME_TIMEOUT_S)
+        _move_to_init_qpos(base, base_cyclic)
 
         current_q_rad = _get_measured_q_rad(base_cyclic)
         if current_q_rad.shape[0] != _NUM_ARM_JOINTS:
@@ -374,32 +367,29 @@ def main() -> None:
         if base_body_id != -1:
             base_xmat = state_data.xmat[base_body_id].reshape(3, 3).copy()
 
-        hand, hand_controller = _make_hand_controller(args)
-
         initial_wrist_position = None
         initial_wrist_quaternion = None
         target_position = initial_site_pos.copy()
         target_quaternion = np.array(initial_site_quat, dtype=np.float64)
-        latest_hand_qpos = None
         latest_residual = None
         latest_euler_residual = None
         smoothed_residual = None
+        latest_gripper_pos = None
         last_log_time = time.time()
         last_valid_packet_time = 0.0
 
         print(f"  Initial arm q (deg): {np.rad2deg(current_q_rad).tolist()}")
-        print(f"  HOME_QPOS (deg):     {np.rad2deg(_HOME_QPOS).tolist()}")
+        print(f"  HOME_QPOS (deg):     {np.rad2deg(_INIT_QPOS).tolist()}")
         print(f"  Initial EE pos:      {initial_site_pos.tolist()}")
         print(f"  model.nq={model.nq}  model.nv={model.nv}")
         print("Starting real teleoperation loop...")
         print(f"  Kinova IP: {args.kinova_ip}")
         print(f"  Quest UDP port: {args.port}")
-        print("  Hand side: right")
         print(f"  Arm speed limit: ±{_ARM_MAX_SPEED_DEG:.1f} deg/s")
         print(f"  Packet timeout: {_PACKET_TIMEOUT_S:.3f} s")
         print(f"  Wrist position deadband: {_WRIST_POS_DEADBAND:.3f} m")
         print(f"  Wrist rotation deadband: {_WRIST_ROT_DEADBAND_DEG:.1f} deg")
-        print("  Wrist rotation tracking: ON")
+        print("  Gripper: Robotiq 2F-85 (Kortex API)")
         print("Press Ctrl+C to stop.")
 
         try:
@@ -411,15 +401,16 @@ def main() -> None:
                     message = packet.decode("utf-8", errors="ignore")
                     saw_valid_data = False
 
-                    if retargeter is not None:
-                        landmarks = parse_landmarks(message)
-                        if landmarks is not None:
-                            mediapipe_pts = _landmarks_to_mediapipe(landmarks)
-                            if not np.allclose(mediapipe_pts, 0):
-                                latest_hand_qpos = retargeter.retarget(mediapipe_pts)
-                                saw_valid_data = True
+                    # --- Gripper: pinch distance from landmarks ---
+                    landmarks = parse_right_landmarks(message)
+                    if landmarks is not None:
+                        pinch_distance = pinch_distance_from_landmarks(landmarks)
+                        if pinch_distance is not None:
+                            latest_gripper_pos = _pinch_to_gripper_position(pinch_distance)
+                            saw_valid_data = True
 
-                    wrist_pose = parse_wrist_pose(message)
+                    # --- Arm: wrist pose residuals ---
+                    wrist_pose = parse_right_wrist_pose(message)
                     if wrist_pose is not None:
                         wrist_position = (wrist_pose[0], wrist_pose[1], wrist_pose[2])
                         wrist_quaternion = (
@@ -451,21 +442,20 @@ def main() -> None:
                                 smoothed_residual = residual
                             else:
                                 smoothed_residual = (
-                                    _EMA_ALPHA * residual
-                                    + (1.0 - _EMA_ALPHA) * smoothed_residual
+                                    args.ema_alpha * residual
+                                    + (1.0 - args.ema_alpha) * smoothed_residual
                                 )
                             smoothed_residual = _apply_position_deadband(
                                 smoothed_residual, _WRIST_POS_DEADBAND
                             )
                             target_position = (
-                                initial_site_pos + _POSITION_SCALE * smoothed_residual
+                                initial_site_pos + args.position_scale * smoothed_residual
                             )
 
                             relative_quaternion = quaternion_multiply(
                                 robot_quaternion,
                                 quaternion_inverse(initial_wrist_quaternion),
                             )
-                            # Empirical correction matching the existing Gen3 teleop setup.
                             relative_quaternion = (
                                 -relative_quaternion[0],
                                 -relative_quaternion[1],
@@ -499,17 +489,18 @@ def main() -> None:
                     and latest_euler_residual is not None
                     and now - last_log_time > 1.0
                 ):
+                    gripper_str = f"  gripper: {latest_gripper_pos:.2f}" if latest_gripper_pos is not None else ""
                     print(
                         f"Wrist residual (xyz): {latest_residual.tolist()} "
-                        f"euler: {list(latest_euler_residual)}"
+                        f"euler: {list(latest_euler_residual)}{gripper_str}"
                     )
                     last_log_time = now
 
-                if latest_hand_qpos is not None and hand_controller is not None:
-                    hand_controller.set_joint_target_position(
-                        np.asarray(latest_hand_qpos, dtype=np.float64).reshape(5, 4)
-                    )
+                # --- Send gripper command ---
+                if latest_gripper_pos is not None:
+                    _send_gripper_command(base, latest_gripper_pos)
 
+                # --- Send arm command ---
                 current_q_rad = _get_measured_q_rad(base_cyclic)
                 current_q_deg = np.rad2deg(current_q_rad)
 
@@ -521,8 +512,6 @@ def main() -> None:
                         _build_joint_speeds_command(np.zeros(_NUM_ARM_JOINTS, dtype=np.float64))
                     )
                 else:
-                    # Start from model default qpos (has valid quaternions for
-                    # free joints like the target_cube) and override arm joints.
                     q_init = np.array(model.qpos0, dtype=np.float64)
                     q_init[:_NUM_ARM_JOINTS] = current_q_rad
                     q_sol = solve_pose_ik(
@@ -532,10 +521,10 @@ def main() -> None:
                         target_position,
                         target_quaternion,
                         q_init,
-                        rot_weight=_ROT_WEIGHT,
-                        damping=_IK_DAMPING,
-                        current_q_weight=_IK_CURRENT_WEIGHT,
-                        home_qpos=_HOME_QPOS,
+                        rot_weight=args.rot_weight,
+                        damping=args.ik_damping,
+                        current_q_weight=args.ik_current_weight,
+                        home_qpos=_INIT_QPOS,
                         skip_tail_joints=0,
                     )
                     q_target_deg = np.rad2deg(q_sol[:_NUM_ARM_JOINTS])
@@ -547,7 +536,7 @@ def main() -> None:
                         -_ARM_MAX_SPEED_DEG,
                         _ARM_MAX_SPEED_DEG,
                     )
-                    if now - last_log_time < 0.1:  # print once near each log
+                    if now - last_log_time < 0.1:
                         print(
                             f"  IK target pos: {target_position.tolist()}\n"
                             f"  q_current(deg): {current_q_deg.tolist()}\n"
@@ -566,11 +555,6 @@ def main() -> None:
             print("\nStopping teleoperation...")
         finally:
             _stop_arm(base)
-            if hand is not None:
-                try:
-                    hand.write_joint_enabled(False)
-                except Exception as exc:  # pragma: no cover - hardware dependent
-                    print(f"Warning: failed to disable Wuji hand cleanly: {exc}")
             sock.close()
 
 

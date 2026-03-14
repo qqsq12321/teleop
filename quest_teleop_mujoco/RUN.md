@@ -23,7 +23,7 @@ python3 teleop_env/teleop.py --port 9000
 ```bash
 conda activate teleop
 cd /home/hand/teleop/quest_teleop_mujoco
-python3 teleop_env/teleop_kinova.py --port 9000
+python3 teleop_env/teleop_kinova_gripper_sim.py --port 9000
 ```
 
 - 机器人: Kinova Gen3 7-DOF + Robotiq 2F-85 夹爪

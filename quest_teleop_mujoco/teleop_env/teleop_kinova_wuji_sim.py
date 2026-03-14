@@ -4,8 +4,8 @@ Arm: wrist pose residuals -> IK (7 DOF)
 Hand: 21 landmarks -> retargeting -> 20 finger joints
 
 Usage:
-    python teleop_env/teleop_kinova_wuji.py --port 9000
-    python teleop_env/teleop_kinova_wuji.py --hand-config path/to/config.yaml --port 9000
+    python teleop_env/teleop_kinova_wuji_sim.py --port 9000
+    python teleop_env/teleop_kinova_wuji_sim.py --hand-config path/to/config.yaml --port 9000
 """
 
 from __future__ import annotations
