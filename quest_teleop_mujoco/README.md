@@ -78,9 +78,6 @@ python3 teleop_env/teleop_bimanual.py --port 9000
 # 将 Kinova 回到官方 Home 位姿
 PYTHONPATH=/home/hand PYTHONUNBUFFERED=1 python3 move_home.py --kinova-ip 192.168.1.10
 
-# 测试 Robotiq 夹爪开合
-PYTHONPATH=/home/hand PYTHONUNBUFFERED=1 python3 test_gripper.py
-
 # 可视化 MuJoCo 场景（无需 Quest）
 python3 teleop_env/visualize.py teleop_env/scene/scene_kinova_gen3.xml
 ```
@@ -101,7 +98,6 @@ quest_teleop_mujoco/
 ├── util/                    # 工具模块 (IK, 四元数, UDP 解析)
 ├── Kinova-kortex2_Gen3_G3L/ # Kinova Kortex SDK (vendored)
 ├── move_home.py             # Kinova 回 Home 工具
-├── test_gripper.py          # 夹爪测试工具
 └── README.md
 ```
 
