@@ -57,7 +57,7 @@ from kortex_api.autogen.messages import Base_pb2  # noqa: E402
 
 # Gen3 initial pose (7 arm joints) used as IK prior and startup target.
 _INIT_QPOS = np.array(
-    [0.0, 0.585, 3.14, -1.6, 0.0, -0.861, 1.57],
+    [1.57079633, 0.26179939, 3.14159265, -2.26892803, 0.0, 0.95993109, 1.57079633],
     dtype=np.float64,
 )
 
@@ -79,6 +79,8 @@ _IK_CURRENT_WEIGHT = 0.1
 _ARM_DEADBAND_DEG = 0.5
 _CONTROL_PERIOD_S = 0.02
 _PACKET_TIMEOUT_S = 0.25
+_GRIPPER_EMA_ALPHA = 0.3
+_GRIPPER_COMMAND_THRESHOLD = 0.02
 _HOME_TIMEOUT_S = 30.0
 _DEFAULT_SITE = "kinova_ee_site"
 
@@ -375,6 +377,8 @@ def main() -> None:
         latest_euler_residual = None
         smoothed_residual = None
         latest_gripper_pos = None
+        smoothed_gripper_pos = None
+        last_sent_gripper_pos = None
         last_log_time = time.time()
         last_valid_packet_time = 0.0
 
@@ -406,17 +410,28 @@ def main() -> None:
                     if landmarks is not None:
                         pinch_distance = pinch_distance_from_landmarks(landmarks)
                         if pinch_distance is not None:
-                            latest_gripper_pos = _pinch_to_gripper_position(pinch_distance)
+                            raw_gripper_pos = _pinch_to_gripper_position(pinch_distance)
+                            if smoothed_gripper_pos is None:
+                                smoothed_gripper_pos = raw_gripper_pos
+                            else:
+                                smoothed_gripper_pos = (
+                                    _GRIPPER_EMA_ALPHA * raw_gripper_pos
+                                    + (1.0 - _GRIPPER_EMA_ALPHA) * smoothed_gripper_pos
+                                )
+                            latest_gripper_pos = smoothed_gripper_pos
                             saw_valid_data = True
 
                     # --- Arm: wrist pose residuals ---
                     wrist_pose = parse_right_wrist_pose(message)
                     if wrist_pose is not None:
-                        wrist_position = (wrist_pose[0], wrist_pose[1], wrist_pose[2])
+                        # Rotate camera coordinate system +90° around Y (clockwise when looking down +Y):
+                        # x' = z, y' = y, z' = -x
+                        raw_x, raw_y, raw_z = wrist_pose[0], wrist_pose[1], wrist_pose[2]
+                        wrist_position = (raw_z, raw_y, -raw_x)
                         wrist_quaternion = (
-                            wrist_pose[3],
-                            wrist_pose[4],
                             wrist_pose[5],
+                            wrist_pose[4],
+                            -wrist_pose[3],
                             wrist_pose[6],
                         )
                         robot_position, robot_quaternion = transform_vr_to_robot_pose(
@@ -497,8 +512,12 @@ def main() -> None:
                     last_log_time = now
 
                 # --- Send gripper command ---
-                if latest_gripper_pos is not None:
+                if latest_gripper_pos is not None and (
+                    last_sent_gripper_pos is None
+                    or abs(latest_gripper_pos - last_sent_gripper_pos) > _GRIPPER_COMMAND_THRESHOLD
+                ):
                     _send_gripper_command(base, latest_gripper_pos)
+                    last_sent_gripper_pos = latest_gripper_pos
 
                 # --- Send arm command ---
                 current_q_rad = _get_measured_q_rad(base_cyclic)
