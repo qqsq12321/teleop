@@ -6,7 +6,12 @@
 optimizer:
   type: "AdaptiveOptimizerAnalytical"
 
+robot:
+  type: "wuji_hand"
+  urdf_path: "assets/wuji_hand/right.urdf"
+
 retarget:
+  lp_alpha: 1.0               # No extra smoothing in retarget output
   # Huber loss thresholds
   huber_delta: 2.0             # Position Huber threshold (cm)
   huber_delta_dir: 0.5         # Direction Huber threshold

@@ -15,6 +15,7 @@ import sys
 from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "AnyDexRetarget"))
 
 import argparse
 import math
@@ -27,7 +28,7 @@ from types import SimpleNamespace
 import mujoco
 import numpy as np
 
-from wuji_retargeting import Retargeter
+from anydexretarget import Retargeter
 
 from util.ik import solve_pose_ik
 from util.quaternion import (
@@ -64,8 +65,8 @@ from kortex_api.autogen.client_stubs.BaseCyclicClientRpc import BaseCyclicClient
 from kortex_api.autogen.messages import Base_pb2  # noqa: E402
 
 # Gen3 home pose used only as an IK regularization prior.
-_HOME_QPOS = np.array(
-    [0.0, 0.26179939, 3.14159265, -2.26892803, 0.0, 0.95993109, 1.57079633],
+_INIT_QPOS = np.array(
+    [1.57079633, 0.26179939, 3.14159265, -2.26892803, 0.0, 0.95993109, 1.57079633],
     dtype=np.float64,
 )
 
@@ -306,6 +307,39 @@ def _move_arm_home(base: BaseClient, timeout: float = 30.0) -> bool:
         base.Unsubscribe(notification_handle)
 
 
+def _move_to_init_qpos(
+    base: BaseClient,
+    base_cyclic: BaseCyclicClient,
+    timeout: float = 15.0,
+    kp: float = 2.0,
+    max_speed: float = 30.0,
+    threshold_deg: float = 1.0,
+    dt: float = 0.02,
+) -> None:
+    """Drive arm from current pose to _INIT_QPOS using joint speed commands."""
+    target_deg = np.rad2deg(_INIT_QPOS)
+    print(f"Moving to _INIT_QPOS (deg): {target_deg.tolist()}")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        current_rad = _get_measured_q_rad(base_cyclic)
+        current_deg = np.rad2deg(current_rad)
+        err_deg = _angle_error_deg(target_deg, current_deg)
+        if np.all(np.abs(err_deg) < threshold_deg):
+            print("Reached _INIT_QPOS.")
+            base.SendJointSpeedsCommand(
+                _build_joint_speeds_command(np.zeros(_NUM_ARM_JOINTS, dtype=np.float64))
+            )
+            return
+        speed_deg_s = np.clip(kp * err_deg, -max_speed, max_speed)
+        speed_deg_s[np.abs(err_deg) < _ARM_DEADBAND_DEG] = 0.0
+        base.SendJointSpeedsCommand(_build_joint_speeds_command(speed_deg_s))
+        time.sleep(dt)
+    print("Warning: timeout moving to _INIT_QPOS.")
+    base.SendJointSpeedsCommand(
+        _build_joint_speeds_command(np.zeros(_NUM_ARM_JOINTS, dtype=np.float64))
+    )
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -390,6 +424,7 @@ def main() -> None:
         base.SetServoingMode(servo_mode)
 
         _move_arm_home(base, timeout=_HOME_TIMEOUT_S)
+        _move_to_init_qpos(base, base_cyclic)
 
         current_q_rad = _get_measured_q_rad(base_cyclic)
         if current_q_rad.shape[0] != _NUM_ARM_JOINTS:
@@ -423,7 +458,7 @@ def main() -> None:
         last_valid_packet_time = 0.0
 
         print(f"  Initial arm q (deg): {np.rad2deg(current_q_rad).tolist()}")
-        print(f"  HOME_QPOS (deg):     {np.rad2deg(_HOME_QPOS).tolist()}")
+        print(f"  HOME_QPOS (deg):     {np.rad2deg(_INIT_QPOS).tolist()}")
         print(f"  Initial EE pos:      {initial_site_pos.tolist()}")
         print(f"  model.nq={model.nq}  model.nv={model.nv}")
         print("Starting real teleoperation loop...")
@@ -456,11 +491,14 @@ def main() -> None:
 
                     wrist_pose = parse_wrist_pose(message)
                     if wrist_pose is not None:
-                        wrist_position = (wrist_pose[0], wrist_pose[1], wrist_pose[2])
+                        # Rotate camera coordinate system +90° around Y (clockwise when looking down +Y):
+                        # x' = z, y' = y, z' = -x
+                        raw_x, raw_y, raw_z = wrist_pose[0], wrist_pose[1], wrist_pose[2]
+                        wrist_position = (raw_z, raw_y, -raw_x)
                         wrist_quaternion = (
-                            wrist_pose[3],
-                            wrist_pose[4],
                             wrist_pose[5],
+                            wrist_pose[4],
+                            -wrist_pose[3],
                             wrist_pose[6],
                         )
                         robot_position, robot_quaternion = transform_vr_to_robot_pose(
@@ -570,7 +608,7 @@ def main() -> None:
                         rot_weight=_ROT_WEIGHT,
                         damping=_IK_DAMPING,
                         current_q_weight=_IK_CURRENT_WEIGHT,
-                        home_qpos=_HOME_QPOS,
+                        home_qpos=_INIT_QPOS,
                         skip_tail_joints=0,
                     )
                     q_target_deg = np.rad2deg(q_sol[:_NUM_ARM_JOINTS])
