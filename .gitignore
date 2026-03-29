@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# IDE / tool files
+.claude/
+
+# MuJoCo logs
+MUJOCO_LOG.TXT
