@@ -20,7 +20,7 @@
 - Python 3.10+，使用 conda 环境 `teleop`（`conda activate teleop`）
 - MuJoCo (`pip install mujoco`)
 - Wuji Hand 相关额外需要:
-  - `wuji_retargeting` — 手部重定向库（来自 `wuji-retargeting` 仓库）
+  - `AnyDexRetarget` — 手部重定向库（克隆到本仓库根目录下）
   - `wujihandpy` — Wuji Hand 硬件 SDK（实物控制时需要）
 - Kinova 实物控制额外需要: Kinova Kortex SDK (`pip install kortex-api`)
 

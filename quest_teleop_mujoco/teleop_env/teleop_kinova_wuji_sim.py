@@ -14,6 +14,7 @@ import sys
 from pathlib import Path as _Path
 
 sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent / "AnyDexRetarget"))
 
 import argparse
 import socket
@@ -24,7 +25,7 @@ import mujoco
 import numpy as np
 from mujoco import viewer
 
-from wuji_retargeting import Retargeter
+from anydexretarget import Retargeter
 
 from util.ik import solve_pose_ik
 from util.quaternion import (
@@ -67,6 +68,16 @@ def _default_scene_path() -> Path:
 
 def _default_hand_config_path() -> Path:
     return _Path(__file__).resolve().parent / "adaptive_analytical_quest3.yaml"
+
+
+def _recv_latest_packet(sock: socket.socket) -> bytes | None:
+    latest = None
+    while True:
+        try:
+            latest, _ = sock.recvfrom(65536)
+        except BlockingIOError:
+            break
+    return latest
 
 
 def _apply_initial_pose(model: mujoco.MjModel, data: mujoco.MjData) -> None:
@@ -196,10 +207,8 @@ def main() -> None:
         vis.cam.distance = model.stat.extent * 1.5
         vis.cam.lookat[:] = model.stat.center
         while vis.is_running():
-            try:
-                packet, _ = sock.recvfrom(65536)
-            except BlockingIOError:
-                packet = None
+            loop_start = time.time()
+            packet = _recv_latest_packet(sock)
 
             if packet is not None:
                 message = packet.decode("utf-8", errors="ignore")
@@ -319,7 +328,7 @@ def main() -> None:
             mujoco.mj_step(model, data)
             vis.sync()
 
-            sleep_time = model.opt.timestep
+            sleep_time = model.opt.timestep - (time.time() - loop_start)
             if sleep_time > 0:
                 time.sleep(sleep_time)
 

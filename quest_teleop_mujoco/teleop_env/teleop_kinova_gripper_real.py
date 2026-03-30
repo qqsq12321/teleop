@@ -64,7 +64,7 @@ _INIT_QPOS = np.array(
 _NUM_ARM_JOINTS = 7
 
 # Pinch distance normalization (meters)
-_PINCH_MAX_DISTANCE = 0.1
+_PINCH_MAX_DISTANCE = 0.06
 
 # Fixed Kinova teleop gains/limits.
 _POSITION_SCALE = 1.0
@@ -79,7 +79,7 @@ _IK_CURRENT_WEIGHT = 0.1
 _ARM_DEADBAND_DEG = 0.5
 _CONTROL_PERIOD_S = 0.02
 _PACKET_TIMEOUT_S = 0.25
-_GRIPPER_EMA_ALPHA = 0.3
+_GRIPPER_EMA_ALPHA = 0.5
 _GRIPPER_COMMAND_THRESHOLD = 0.02
 _HOME_TIMEOUT_S = 30.0
 _DEFAULT_SITE = "kinova_ee_site"
@@ -145,12 +145,11 @@ def _parse_args() -> argparse.Namespace:
 def _pinch_to_gripper_position(pinch_distance: float) -> float:
     """Map pinch distance to Kortex gripper position (0.0=open, 1.0=closed).
 
-    Small distance (pinched) -> large value (closed).
-    Large distance (open hand) -> small value (open).
+    Binary: pinch < threshold -> closed, otherwise -> open.
     """
-    scaled = pinch_distance / _PINCH_MAX_DISTANCE
-    clamped = min(1.0, max(0.0, scaled))
-    return 1.0 - clamped
+    if pinch_distance < 0.03:
+        return 1.0
+    return 0.0
 
 
 def _angle_error_deg(target_deg: np.ndarray, current_deg: np.ndarray) -> np.ndarray:
@@ -203,17 +202,20 @@ def _stop_arm(base: BaseClient) -> None:
 
 
 def _send_gripper_command(base: BaseClient, position: float) -> None:
-    """Send gripper position command via Kortex high-level API.
+    """Send gripper speed command via Kortex high-level API.
 
     Args:
         base: Kortex BaseClient.
-        position: Gripper target position, 0.0 (open) to 1.0 (closed).
+        position: 1.0 = close, 0.0 = open.
     """
     gripper_command = Base_pb2.GripperCommand()
-    gripper_command.mode = Base_pb2.GRIPPER_POSITION
+    gripper_command.mode = Base_pb2.GRIPPER_SPEED
     finger = gripper_command.gripper.finger.add()
     finger.finger_identifier = 0
-    finger.value = float(position)
+    if position >= 1.0:
+        finger.value = -1.0  # close at max speed
+    else:
+        finger.value = 1.0   # open at max speed
     base.SendGripperCommand(gripper_command)
 
 
@@ -405,20 +407,16 @@ def main() -> None:
                     message = packet.decode("utf-8", errors="ignore")
                     saw_valid_data = False
 
+                    # Debug: print packet keys once
+                    if initial_wrist_position is None and "landmarks" not in message.lower():
+                        print(f"[DEBUG] Packet has no landmarks. Lines: {[l.split(':')[0] for l in message.splitlines() if l.strip()]}")
+
                     # --- Gripper: pinch distance from landmarks ---
                     landmarks = parse_right_landmarks(message)
                     if landmarks is not None:
                         pinch_distance = pinch_distance_from_landmarks(landmarks)
                         if pinch_distance is not None:
-                            raw_gripper_pos = _pinch_to_gripper_position(pinch_distance)
-                            if smoothed_gripper_pos is None:
-                                smoothed_gripper_pos = raw_gripper_pos
-                            else:
-                                smoothed_gripper_pos = (
-                                    _GRIPPER_EMA_ALPHA * raw_gripper_pos
-                                    + (1.0 - _GRIPPER_EMA_ALPHA) * smoothed_gripper_pos
-                                )
-                            latest_gripper_pos = smoothed_gripper_pos
+                            latest_gripper_pos = _pinch_to_gripper_position(pinch_distance)
                             saw_valid_data = True
 
                     # --- Arm: wrist pose residuals ---
@@ -511,14 +509,6 @@ def main() -> None:
                     )
                     last_log_time = now
 
-                # --- Send gripper command ---
-                if latest_gripper_pos is not None and (
-                    last_sent_gripper_pos is None
-                    or abs(latest_gripper_pos - last_sent_gripper_pos) > _GRIPPER_COMMAND_THRESHOLD
-                ):
-                    _send_gripper_command(base, latest_gripper_pos)
-                    last_sent_gripper_pos = latest_gripper_pos
-
                 # --- Send arm command ---
                 current_q_rad = _get_measured_q_rad(base_cyclic)
                 current_q_deg = np.rad2deg(current_q_rad)
@@ -564,6 +554,10 @@ def main() -> None:
                             f"  speed  (deg/s): {speed_deg_s.tolist()}"
                         )
                     base.SendJointSpeedsCommand(_build_joint_speeds_command(speed_deg_s))
+
+                # --- Send gripper command (after arm, so it won't be overridden) ---
+                if latest_gripper_pos is not None:
+                    _send_gripper_command(base, latest_gripper_pos)
 
                 elapsed = time.time() - loop_start
                 sleep_time = _CONTROL_PERIOD_S - elapsed
