@@ -362,7 +362,7 @@ def _run_hand_only(args: argparse.Namespace) -> None:
                 # --- Apple Vision Pro path ---
                 if avp_input.poll():
                     # Check dual pinch stop gesture
-                    if avp_input.check_dual_pinch_stop():
+                    if avp_input.check_stop_gesture():
                         print("\nStopping teleoperation (dual pinch)...")
                         break
 
@@ -463,8 +463,6 @@ def _run_arm_teleop(config: dict, args: argparse.Namespace) -> None:
         servo_mode.servoing_mode = Base_pb2.SINGLE_LEVEL_SERVOING
         base.SetServoingMode(servo_mode)
 
-        if is_wuji:
-            _move_arm_home(base, timeout=_HOME_TIMEOUT_S)
         _move_to_init_qpos(base, base_cyclic)
 
         current_q_rad = _get_measured_q_rad(base_cyclic)
@@ -529,7 +527,7 @@ def _run_arm_teleop(config: dict, args: argparse.Namespace) -> None:
                     # --- Apple Vision Pro path ---
                     if avp_input.poll():
                         # Check dual pinch stop gesture
-                        if avp_input.check_dual_pinch_stop():
+                        if avp_input.check_stop_gesture():
                             print("\nStopping teleoperation (dual pinch)...")
                             break
 

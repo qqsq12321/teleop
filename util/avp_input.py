@@ -109,7 +109,7 @@ class AVPInput:
 
         self._streamer = VisionProStreamer(ip=ip, record=False)
         self._latest = None
-        self._dual_pinch_start = None
+        self._stop_gesture_start = None
 
     # -- per-frame refresh --------------------------------------------------
 
@@ -201,48 +201,50 @@ class AVPInput:
             return None
         return float(hand.pinch_distance)
 
-    # -- dual pinch stop gesture --------------------------------------------
+    # -- left fist stop gesture ---------------------------------------------
 
-    _DUAL_PINCH_THRESHOLD = 0.02  # meters
-    _DUAL_PINCH_HOLD_S = 3.0     # seconds
+    _FIST_THRESHOLD = 0.06   # meters — max fingertip-to-wrist distance for fist
+    _FIST_HOLD_S = 3.0       # seconds to hold before triggering stop
+    # Fingertip indices in the 27-joint skeleton: thumb(4), index(9), middle(14), ring(19), little(24)
+    _FINGERTIP_INDICES = (4, 9, 14, 19, 24)
 
-    def check_dual_pinch_stop(self) -> bool:
-        """Return True if both hands are pinching for 3+ seconds (stop gesture).
+    def check_stop_gesture(self) -> bool:
+        """Return True if left hand is in a fist for 3+ seconds (stop gesture).
 
-        Call once per loop iteration. Prints countdown warnings.
+        Detects fist by checking all fingertip-to-wrist distances are small.
+        Call once per loop iteration.
         """
         if self._latest is None:
-            self._dual_pinch_start = None
+            self._stop_gesture_start = None
             return False
         left = self._latest.left
-        right = self._latest.right
-        if left is None or right is None:
-            self._dual_pinch_start = None
+        if left is None or left.shape[0] < 25:
+            self._stop_gesture_start = None
             return False
 
-        both_pinching = (
-            left.pinch_distance < self._DUAL_PINCH_THRESHOLD
-            and right.pinch_distance < self._DUAL_PINCH_THRESHOLD
-        )
+        wrist_pos = left[0][:3, 3]  # wrist joint position
+        is_fist = True
+        for tip_idx in self._FINGERTIP_INDICES:
+            tip_pos = left[tip_idx][:3, 3]
+            dist = float(np.linalg.norm(tip_pos - wrist_pos))
+            if dist > self._FIST_THRESHOLD:
+                is_fist = False
+                break
 
-        if not both_pinching:
-            if self._dual_pinch_start is not None:
-                self._dual_pinch_start = None
+        if not is_fist:
+            if self._stop_gesture_start is not None:
+                self._stop_gesture_start = None
             return False
 
         import time
         now = time.time()
-        if self._dual_pinch_start is None:
-            self._dual_pinch_start = now
-            print("Dual pinch detected — hold 3s to stop...")
+        if self._stop_gesture_start is None:
+            self._stop_gesture_start = now
+            print("Left fist detected — hold 3s to stop...")
             return False
 
-        elapsed = now - self._dual_pinch_start
-        # Print countdown every second
-        remaining = self._DUAL_PINCH_HOLD_S - elapsed
-        if remaining > 0 and int(remaining) < int(remaining + 0.02):
-            pass  # avoid spam
-        if elapsed >= self._DUAL_PINCH_HOLD_S:
-            print("Dual pinch stop triggered!")
+        elapsed = now - self._stop_gesture_start
+        if elapsed >= self._FIST_HOLD_S:
+            print("Left fist stop triggered!")
             return True
         return False
