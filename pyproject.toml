@@ -1,7 +1,7 @@
 [project]
 name = "quest-teleop-mujoco"
 version = "0.1.0"
-description = "Add your description here"
+description = "VR hand-tracking teleoperation for MuJoCo simulation and real robot arms."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

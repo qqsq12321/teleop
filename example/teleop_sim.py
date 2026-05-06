@@ -4,6 +4,7 @@ Supports multiple robot configurations via --robot:
   piper          Piper single-arm with pinch gripper
   kinova_gripper Kinova Gen3 + Robotiq 2F-85 gripper
   kinova_wuji    Kinova Gen3 + Wuji dexterous hand (20 DOF)
+  rm65           Realman RM65 6-DOF arm (no end-effector)
   aloha          Aloha bimanual (dual 6-DOF arms + grippers)
 
 Input sources (--input-source):
@@ -37,12 +38,10 @@ from mujoco import viewer
 from util.ik import solve_pose_ik
 from util.quaternion import (
     matrix_to_quaternion,
-    quaternion_inverse,
-    quaternion_multiply,
-    quaternion_to_euler_xyz,
     transform_vr_to_robot_pose,
 )
 from util.udp_socket import (
+    clamp_pinch_ratio,
     make_socket,
     recv_latest_packet,
     parse_left_landmarks,
@@ -50,10 +49,9 @@ from util.udp_socket import (
     parse_right_landmarks,
     parse_right_wrist_pose,
     pinch_distance_from_landmarks,
-    pinch_to_gripper,
 )
 from util.wrist_tracker import WristTracker
-from util.hand_retarget import HandRetargeter
+from util.hand_retarget import HandRetargeter, default_inspire_config_path
 
 # ---------------------------------------------------------------------------
 # Scene / config paths
@@ -117,13 +115,53 @@ ROBOT_CONFIGS = {
             [0.0, 0.26179939, 3.14159265, -2.26892803, 0.0, 0.95993109, 1.57079633],
             dtype=np.float64,
         ),
-        "negate_rot_xy": True,
         "position_scale": 1.5,
         "hand_type": "wuji",
         "negate_rot_xy": True,
         "skip_tail_joints": 0,
         "num_arm_actuators": 7,
         "num_hand_actuators": 20,
+        "bimanual": False,
+    },
+    "rm65": {
+        "scene_xml": str(_SCENE_DIR / "scene_rm65.xml"),
+        "site_name": "rm65_ee_site",
+        "site_fallback": None,
+        "base_body_name": "base_link",
+        "base_body_fallback": None,
+        "home_qpos": np.array(
+            [0.0, -0.522, -1.81, 0.0099, 0.782, 0.0],
+            dtype=np.float64,
+        ),
+        "position_scale": 1.5,
+        "hand_type": "gripper",
+        "negate_rot_xy": True,
+        "skip_tail_joints": 0,
+        "gripper_actuator_name": "fingers_actuator",
+        "gripper_actuator_fallback": None,
+        "gripper_joint_names": [],
+        "pinch_max_distance": 0.1,
+        "gripper_max": 0.82,
+        "pinch_inverted": True,
+        "bimanual": False,
+    },
+    "rm65_inspire": {
+        "scene_xml": str(_SCENE_DIR / "scene_rm65_inspire.xml"),
+        "site_name": "rm65_ee_site",
+        "site_fallback": None,
+        "base_body_name": "base_link",
+        "base_body_fallback": None,
+        "home_qpos": np.array(
+            [0.0, -0.522, -1.81, 0.0099, 0.782, 0.0],
+            dtype=np.float64,
+        ),
+        "position_scale": 1.5,
+        "hand_type": "inspire",
+        "negate_rot_xy": True,
+        "skip_tail_joints": 0,
+        "num_arm_actuators": 6,
+        "num_hand_actuators": 12,
+        "hand_qpos_mapping": [8, 9, 10, 11, 0, 1, 2, 3, 6, 7, 4, 5],
         "bimanual": False,
     },
     "aloha": {
@@ -138,16 +176,29 @@ ROBOT_CONFIGS = {
 # ---------------------------------------------------------------------------
 
 
-def _pinch_to_gripper(pinch_distance: float, pinch_max: float, gripper_max: float) -> float:
-    """Map pinch distance to gripper control value (generic)."""
-    scaled = pinch_distance / pinch_max
-    clamped = min(1.0, max(0.0, scaled))
-    return gripper_max * (1.0 - clamped)
+def _pinch_to_gripper(
+    pinch_distance: float, pinch_max: float, gripper_max: float, inverted: bool = False
+) -> float:
+    """Map pinch distance to gripper control value.
+
+    ``inverted=False``: ctrl = gripper_max when pinched, 0 when open
+    (normally-open grippers like Robotiq 2F-85).
+    ``inverted=True``: reverse for normally-closed grippers like EG2-4C2.
+    """
+    ratio = clamp_pinch_ratio(pinch_distance, pinch_max)
+    return gripper_max * ratio if inverted else gripper_max * (1.0 - ratio)
 
 
 # ---------------------------------------------------------------------------
 # Aloha bimanual ArmController (kept from original teleop_bimanual.py)
 # ---------------------------------------------------------------------------
+
+
+def _wrist_pose_is_finite(wrist_pose) -> bool:
+    return all(
+        isinstance(v, (int, float)) and not np.isnan(v) and not np.isinf(v)
+        for v in wrist_pose
+    )
 
 
 class ArmController:
@@ -199,26 +250,56 @@ class ArmController:
             )
             self.arm_home_qpos = None
 
-        self.initial_site_pos = data.site_xpos[self.site_id].copy()
-        self.initial_site_quat = matrix_to_quaternion(
+        initial_site_pos = data.site_xpos[self.site_id].copy()
+        initial_site_quat = matrix_to_quaternion(
             data.site_xmat[self.site_id].reshape(3, 3).copy()
         )
         base_body_name = f"{side}/base_link"
         base_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_body_name)
-        self.base_xmat = None
+        base_xmat = None
         if base_body_id != -1:
-            self.base_xmat = data.xmat[base_body_id].reshape(3, 3).copy()
+            base_xmat = data.xmat[base_body_id].reshape(3, 3).copy()
 
-        self.initial_wrist_position = None
-        self.initial_wrist_quaternion = None
-        self.target_position = self.initial_site_pos.copy()
-        self.target_quaternion = np.array(self.initial_site_quat, dtype=np.float64)
-        self.latest_residual = None
-        self.latest_euler_residual = None
-        self.smoothed_residual = None
+        self.tracker = WristTracker(
+            initial_site_pos,
+            initial_site_quat,
+            position_scale=args.position_scale,
+            ema_alpha=args.ema_alpha,
+            negate_rot_xy=False,
+            base_xmat=base_xmat,
+        )
         self.latest_gripper_cmd = None
 
-    def update(self, packet_msg: str):
+    # -- pose state shims (keep existing call sites untouched) --------------
+
+    @property
+    def target_position(self):
+        return self.tracker.target_position
+
+    @property
+    def target_quaternion(self):
+        return self.tracker.target_quaternion
+
+    @property
+    def latest_residual(self):
+        return self.tracker.residual
+
+    @property
+    def latest_euler_residual(self):
+        return self.tracker.euler_residual
+
+    # -- input decoupled from pose math -------------------------------------
+
+    def update_from_pose(self, robot_position, robot_quaternion) -> None:
+        self.tracker.update(robot_position, robot_quaternion)
+
+    def update_gripper_from_pinch(self, pinch_distance) -> None:
+        if self.gripper_actuator_id == -1 or pinch_distance is None:
+            return
+        self.latest_gripper_cmd = pinch_to_gripper(pinch_distance)
+
+    def update(self, packet_msg: str) -> None:
+        """Quest 3 path: decode UDP message, then update pose / gripper."""
         if self.side == "right":
             wrist_pose = parse_right_wrist_pose(packet_msg)
             landmarks = parse_right_landmarks(packet_msg)
@@ -226,64 +307,16 @@ class ArmController:
             wrist_pose = parse_left_wrist_pose(packet_msg)
             landmarks = parse_left_landmarks(packet_msg)
 
-        if landmarks is not None and self.gripper_actuator_id != -1:
-            pinch_distance = pinch_distance_from_landmarks(landmarks)
-            if pinch_distance is not None:
-                self.latest_gripper_cmd = pinch_to_gripper(pinch_distance)
+        if landmarks is not None:
+            self.update_gripper_from_pinch(pinch_distance_from_landmarks(landmarks))
 
-        if wrist_pose is not None:
-            valid_pose = all(
-                isinstance(v, (int, float)) and not np.isnan(v) and not np.isinf(v)
-                for v in wrist_pose
+        if wrist_pose is not None and _wrist_pose_is_finite(wrist_pose):
+            wrist_position = (wrist_pose[0], wrist_pose[1], wrist_pose[2])
+            wrist_quaternion = (wrist_pose[3], wrist_pose[4], wrist_pose[5], wrist_pose[6])
+            robot_position, robot_quaternion = transform_vr_to_robot_pose(
+                wrist_position, wrist_quaternion
             )
-            if valid_pose:
-                wrist_position = (wrist_pose[0], wrist_pose[1], wrist_pose[2])
-                wrist_quaternion = (wrist_pose[3], wrist_pose[4], wrist_pose[5], wrist_pose[6])
-                robot_position, robot_quaternion = transform_vr_to_robot_pose(
-                    wrist_position, wrist_quaternion
-                )
-                if self.initial_wrist_position is None:
-                    self.initial_wrist_position = robot_position
-                    self.initial_wrist_quaternion = robot_quaternion
-                else:
-                    residual = np.array(
-                        [
-                            robot_position[0] - self.initial_wrist_position[0],
-                            robot_position[1] - self.initial_wrist_position[1],
-                            robot_position[2] - self.initial_wrist_position[2],
-                        ],
-                        dtype=np.float64,
-                    )
-                    if self.base_xmat is not None:
-                        residual = self.base_xmat @ residual
-                    if self.smoothed_residual is None:
-                        self.smoothed_residual = residual
-                    else:
-                        self.smoothed_residual = (
-                            self.args.ema_alpha * residual
-                            + (1.0 - self.args.ema_alpha) * self.smoothed_residual
-                        )
-                    self.target_position = (
-                        self.initial_site_pos + self.args.position_scale * self.smoothed_residual
-                    )
-                    relative_quaternion = quaternion_multiply(
-                        robot_quaternion,
-                        quaternion_inverse(self.initial_wrist_quaternion),
-                    )
-                    self.target_quaternion = np.array(
-                        quaternion_multiply(relative_quaternion, self.initial_site_quat),
-                        dtype=np.float64,
-                    )
-                    norm = np.linalg.norm(self.target_quaternion)
-                    if norm > 0.0:
-                        self.target_quaternion /= norm
-                    self.latest_residual = self.smoothed_residual
-                    self.latest_euler_residual = quaternion_to_euler_xyz(
-                        relative_quaternion[0],
-                        relative_quaternion[1],
-                        relative_quaternion[2],
-                        relative_quaternion[3],
-                    )
+            self.update_from_pose(robot_position, robot_quaternion)
 
     def step_ik(self):
         return solve_pose_ik(
@@ -396,10 +429,13 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
             if jid != -1:
                 gripper_joint_ids.append(jid)
 
-    # Load retargeter for wuji hand
+    # Load retargeter for wuji or inspire hand
     hand_retargeter = None
     if hand_type == "wuji":
         hand_retargeter = HandRetargeter(args.hand_config, args.hand_side)
+    elif hand_type == "inspire":
+        inspire_cfg = args.hand_config if args.hand_config else str(default_inspire_config_path())
+        hand_retargeter = HandRetargeter(inspire_cfg, args.hand_side)
 
     # Initial EE state
     mujoco.mj_forward(model, data)
@@ -444,6 +480,7 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
     last_log_time = time.time()
     latest_gripper_cmd = None
     latest_hand_qpos = None
+    q_sol = data.qpos[:model.nq].copy()  # 初始化为当前关节角，避免未定义
 
     num_arm_actuators = config.get("num_arm_actuators", model.nu)
     num_hand_actuators = config.get("num_hand_actuators", 0)
@@ -461,11 +498,11 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
             if avp_input is not None:
                 # --- Apple Vision Pro path ---
                 if avp_input.poll():
-                    # Hand retargeting (wuji)
-                    if hand_type == "wuji" and hand_retargeter is not None and hand_retargeter.available:
+                    # Hand retargeting (wuji / inspire)
+                    if hand_type in ("wuji", "inspire") and hand_retargeter is not None and hand_retargeter.available:
                         mediapipe_pts = avp_input.get_landmarks_mediapipe("right")
                         if mediapipe_pts is not None:
-                            result = hand_retargeter._retargeter.retarget(mediapipe_pts)
+                            result = hand_retargeter.retarget_mediapipe(mediapipe_pts)
                             if result is not None:
                                 latest_hand_qpos = result
 
@@ -477,6 +514,7 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
                                 pinch_distance,
                                 config["pinch_max_distance"],
                                 config["gripper_max"],
+                                inverted=config.get("pinch_inverted", False),
                             )
 
                     # Arm: wrist pose
@@ -491,8 +529,8 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
                 if packet is not None:
                     message = packet.decode("utf-8", errors="ignore")
 
-                    # Hand retargeting from landmarks (wuji)
-                    if hand_type == "wuji" and hand_retargeter is not None:
+                    # Hand retargeting from landmarks (wuji / inspire)
+                    if hand_type in ("wuji", "inspire") and hand_retargeter is not None:
                         landmarks = parse_right_landmarks(message)
                         if landmarks is not None:
                             result = hand_retargeter.retarget(landmarks)
@@ -509,6 +547,7 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
                                     pinch_distance,
                                     config["pinch_max_distance"],
                                     config["gripper_max"],
+                                    inverted=config.get("pinch_inverted", False),
                                 )
 
                     # Arm: wrist pose residuals
@@ -537,48 +576,55 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
                 last_log_time = now
 
             # --- IK for arm ---
-            q_sol = solve_pose_ik(
-                model,
-                ik_data,
-                site_id,
-                tracker.target_position,
-                tracker.target_quaternion,
-                data.qpos[: model.nq],
-                rot_weight=args.rot_weight,
-                damping=args.ik_damping,
-                current_q_weight=args.ik_current_weight,
-                home_qpos=home_qpos,
-                skip_tail_joints=config.get("skip_tail_joints", 0),
-            )
+            if tracker.initialized:
+                q_sol_new = solve_pose_ik(
+                    model,
+                    ik_data,
+                    site_id,
+                    tracker.target_position,
+                    tracker.target_quaternion,
+                    data.qpos[: model.nq],
+                    rot_weight=args.rot_weight,
+                    damping=args.ik_damping,
+                    current_q_weight=args.ik_current_weight,
+                    home_qpos=home_qpos,
+                    skip_tail_joints=config.get("skip_tail_joints", 0),
+                )
+                # 丢弃跳变解：任意关节变化超过 30° 则保持上一帧
+                if np.max(np.abs(np.rad2deg(q_sol_new[:6] - q_sol[:6]))) < 30.0:
+                    q_sol = q_sol_new
 
             # --- Apply arm controls ---
-            if hand_type == "wuji":
-                # Wuji: write arm ctrl directly (indices 0..num_arm-1)
-                for i in range(num_arm_actuators):
-                    joint_id = model.actuator_trnid[i, 0]
-                    qadr = model.jnt_qposadr[joint_id]
-                    data.ctrl[i] = q_sol[qadr]
-                # Write hand ctrl
-                if latest_hand_qpos is not None:
-                    data.ctrl[num_arm_actuators : num_arm_actuators + num_hand_actuators] = (
-                        latest_hand_qpos
-                    )
-            else:
-                # Piper / Kinova gripper: skip gripper joints in IK output
-                if model.nu:
-                    ctrl = data.ctrl.copy()
-                    for act_id in range(model.nu):
-                        if model.actuator_trntype[act_id] != 0:  # mjTRN_JOINT = 0
-                            continue
-                        joint_id = model.actuator_trnid[act_id, 0]
-                        if joint_id < 0 or joint_id in gripper_joint_ids:
-                            continue
+            if tracker.initialized:
+                if hand_type in ("wuji", "inspire"):
+                    # Write arm ctrl (indices 0..num_arm-1)
+                    for i in range(num_arm_actuators):
+                        joint_id = model.actuator_trnid[i, 0]
                         qadr = model.jnt_qposadr[joint_id]
-                        if qadr < q_sol.shape[0]:
-                            ctrl[act_id] = q_sol[qadr]
-                    data.ctrl[:] = ctrl
-                if latest_gripper_cmd is not None and gripper_actuator_id != -1:
-                    data.ctrl[gripper_actuator_id] = latest_gripper_cmd
+                        data.ctrl[i] = q_sol[qadr]
+                    # Write hand ctrl
+                    if latest_hand_qpos is not None:
+                        hand_qpos_mapping = config.get("hand_qpos_mapping")
+                        mapped = latest_hand_qpos[hand_qpos_mapping] if hand_qpos_mapping else latest_hand_qpos
+                        data.ctrl[num_arm_actuators : num_arm_actuators + num_hand_actuators] = (
+                            mapped[:num_hand_actuators]
+                        )
+                else:
+                    # Piper / Kinova gripper: skip gripper joints in IK output
+                    if model.nu:
+                        ctrl = data.ctrl.copy()
+                        for act_id in range(model.nu):
+                            if model.actuator_trntype[act_id] != 0:  # mjTRN_JOINT = 0
+                                continue
+                            joint_id = model.actuator_trnid[act_id, 0]
+                            if joint_id < 0 or joint_id in gripper_joint_ids:
+                                continue
+                            qadr = model.jnt_qposadr[joint_id]
+                            if qadr < q_sol.shape[0]:
+                                ctrl[act_id] = q_sol[qadr]
+                        data.ctrl[:] = ctrl
+                    if latest_gripper_cmd is not None and gripper_actuator_id != -1:
+                        data.ctrl[gripper_actuator_id] = latest_gripper_cmd
 
             # --- Step simulation ---
             mujoco.mj_step(model, data)
@@ -587,67 +633,6 @@ def _run_single_arm(config: dict, args: argparse.Namespace) -> None:
             sleep_time = model.opt.timestep - (time.time() - loop_start)
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
-
-# ---------------------------------------------------------------------------
-# AVP helper for bimanual ArmController
-# ---------------------------------------------------------------------------
-
-
-def _update_arm_from_avp(arm: ArmController, avp_input, side: str) -> None:
-    """Update an ArmController from AVP input (mirrors arm.update for Quest)."""
-    # Gripper from pinch distance
-    if arm.gripper_actuator_id != -1:
-        pinch = avp_input.get_pinch_distance(side)
-        if pinch is not None:
-            arm.latest_gripper_cmd = pinch_to_gripper(pinch)
-
-    # Wrist pose
-    wrist = avp_input.get_wrist_pose(side)
-    if wrist is not None:
-        robot_position, robot_quaternion = wrist
-        if arm.initial_wrist_position is None:
-            arm.initial_wrist_position = robot_position
-            arm.initial_wrist_quaternion = robot_quaternion
-        else:
-            residual = np.array(
-                [
-                    robot_position[0] - arm.initial_wrist_position[0],
-                    robot_position[1] - arm.initial_wrist_position[1],
-                    robot_position[2] - arm.initial_wrist_position[2],
-                ],
-                dtype=np.float64,
-            )
-            if arm.base_xmat is not None:
-                residual = arm.base_xmat @ residual
-            if arm.smoothed_residual is None:
-                arm.smoothed_residual = residual
-            else:
-                arm.smoothed_residual = (
-                    arm.args.ema_alpha * residual
-                    + (1.0 - arm.args.ema_alpha) * arm.smoothed_residual
-                )
-            arm.target_position = (
-                arm.initial_site_pos + arm.args.position_scale * arm.smoothed_residual
-            )
-            relative_quaternion = quaternion_multiply(
-                robot_quaternion,
-                quaternion_inverse(arm.initial_wrist_quaternion),
-            )
-            arm.target_quaternion = np.array(
-                quaternion_multiply(relative_quaternion, arm.initial_site_quat),
-                dtype=np.float64,
-            )
-            norm = np.linalg.norm(arm.target_quaternion)
-            if norm > 0.0:
-                arm.target_quaternion /= norm
-            arm.latest_residual = arm.smoothed_residual
-            arm.latest_euler_residual = quaternion_to_euler_xyz(
-                relative_quaternion[0],
-                relative_quaternion[1],
-                relative_quaternion[2],
-                relative_quaternion[3],
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -686,8 +671,11 @@ def _run_bimanual(config: dict, args: argparse.Namespace) -> None:
             if avp_input is not None:
                 # --- Apple Vision Pro path ---
                 if avp_input.poll():
-                    _update_arm_from_avp(left_arm, avp_input, "left")
-                    _update_arm_from_avp(right_arm, avp_input, "right")
+                    for arm, side in ((left_arm, "left"), (right_arm, "right")):
+                        arm.update_gripper_from_pinch(avp_input.get_pinch_distance(side))
+                        wrist = avp_input.get_wrist_pose(side)
+                        if wrist is not None:
+                            arm.update_from_pose(*wrist)
             else:
                 # --- Quest 3 path (unchanged) ---
                 try:

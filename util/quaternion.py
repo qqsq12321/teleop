@@ -1,6 +1,8 @@
 import math
 from typing import Sequence, Tuple
 
+import numpy as np
+
 
 def quaternion_to_euler_xyz(
     x: float, y: float, z: float, w: float
@@ -103,82 +105,25 @@ def transform_vr_to_robot_pose(
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
     x, y, z = position
     robot_position = (z, -x, y)
-
-    transform = (
-        (0.0, 0.0, 1.0),
-        (-1.0, 0.0, 0.0),
-        (0.0, -1.0, 0.0),
-    )
-    vr_matrix = quaternion_to_matrix(quaternion)
-    tmp = (
-        (
-            transform[0][0] * vr_matrix[0][0]
-            + transform[0][1] * vr_matrix[1][0]
-            + transform[0][2] * vr_matrix[2][0],
-            transform[0][0] * vr_matrix[0][1]
-            + transform[0][1] * vr_matrix[1][1]
-            + transform[0][2] * vr_matrix[2][1],
-            transform[0][0] * vr_matrix[0][2]
-            + transform[0][1] * vr_matrix[1][2]
-            + transform[0][2] * vr_matrix[2][2],
-        ),
-        (
-            transform[1][0] * vr_matrix[0][0]
-            + transform[1][1] * vr_matrix[1][0]
-            + transform[1][2] * vr_matrix[2][0],
-            transform[1][0] * vr_matrix[0][1]
-            + transform[1][1] * vr_matrix[1][1]
-            + transform[1][2] * vr_matrix[2][1],
-            transform[1][0] * vr_matrix[0][2]
-            + transform[1][1] * vr_matrix[1][2]
-            + transform[1][2] * vr_matrix[2][2],
-        ),
-        (
-            transform[2][0] * vr_matrix[0][0]
-            + transform[2][1] * vr_matrix[1][0]
-            + transform[2][2] * vr_matrix[2][0],
-            transform[2][0] * vr_matrix[0][1]
-            + transform[2][1] * vr_matrix[1][1]
-            + transform[2][2] * vr_matrix[2][1],
-            transform[2][0] * vr_matrix[0][2]
-            + transform[2][1] * vr_matrix[1][2]
-            + transform[2][2] * vr_matrix[2][2],
-        ),
-    )
-    robot_matrix = (
-        (
-            tmp[0][0] * transform[0][0]
-            + tmp[0][1] * transform[0][1]
-            + tmp[0][2] * transform[0][2],
-            tmp[0][0] * transform[1][0]
-            + tmp[0][1] * transform[1][1]
-            + tmp[0][2] * transform[1][2],
-            tmp[0][0] * transform[2][0]
-            + tmp[0][1] * transform[2][1]
-            + tmp[0][2] * transform[2][2],
-        ),
-        (
-            tmp[1][0] * transform[0][0]
-            + tmp[1][1] * transform[0][1]
-            + tmp[1][2] * transform[0][2],
-            tmp[1][0] * transform[1][0]
-            + tmp[1][1] * transform[1][1]
-            + tmp[1][2] * transform[1][2],
-            tmp[1][0] * transform[2][0]
-            + tmp[1][1] * transform[2][1]
-            + tmp[1][2] * transform[2][2],
-        ),
-        (
-            tmp[2][0] * transform[0][0]
-            + tmp[2][1] * transform[0][1]
-            + tmp[2][2] * transform[0][2],
-            tmp[2][0] * transform[1][0]
-            + tmp[2][1] * transform[1][1]
-            + tmp[2][2] * transform[1][2],
-            tmp[2][0] * transform[2][0]
-            + tmp[2][1] * transform[2][1]
-            + tmp[2][2] * transform[2][2],
-        ),
-    )
-    robot_quaternion = matrix_to_quaternion(robot_matrix)
+    # T: VR frame (x=right, y=up, z=forward) → robot frame (x=forward, y=left, z=up)
+    T = np.array([[0, 0, 1], [-1, 0, 0], [0, -1, 0]], dtype=np.float64)
+    R = np.array(quaternion_to_matrix(quaternion), dtype=np.float64)
+    robot_R = T @ R @ T.T
+    robot_quaternion = matrix_to_quaternion(tuple(tuple(float(v) for v in row) for row in robot_R))
     return robot_position, robot_quaternion
+
+
+def transform_quest3_raw_to_robot_pose(
+    wrist_pose: Sequence[float],
+) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
+    """Convert raw Quest 3 wrist data with real-robot axis mapping.
+
+    The real robot setups (Kinova, RM65) need an additional axis permutation
+    before the standard VR→robot transform. Simulation uses
+    ``transform_vr_to_robot_pose`` directly instead.
+    """
+    x, y, z = wrist_pose[0], wrist_pose[1], wrist_pose[2]
+    qx, qy, qz, qw = wrist_pose[3], wrist_pose[4], wrist_pose[5], wrist_pose[6]
+    wrist_position = (z, y, -x)
+    wrist_quaternion = (qz, qy, -qx, qw)
+    return transform_vr_to_robot_pose(wrist_position, wrist_quaternion)

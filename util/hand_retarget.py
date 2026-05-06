@@ -27,8 +27,23 @@ def default_hand_config_path() -> Path:
         / "AnyDexRetarget"
         / "example"
         / "config"
+        / "adaptive"
         / "quest3"
         / "quest3_wuji_hand.yaml"
+    )
+
+
+def default_inspire_config_path() -> Path:
+    """Return default path to avp_inspire_hand.yaml retarget config."""
+    return (
+        Path(__file__).resolve().parent.parent
+        / "third_party"
+        / "AnyDexRetarget"
+        / "example"
+        / "config"
+        / "adaptive"
+        / "avp"
+        / "avp_inspire_hand.yaml"
     )
 
 
@@ -59,6 +74,12 @@ class HandRetargeter:
         if self._retargeter is None:
             return None
         mediapipe_pts = landmarks_to_mediapipe(raw_landmarks)
+        return self.retarget_mediapipe(mediapipe_pts)
+
+    def retarget_mediapipe(self, mediapipe_pts: np.ndarray) -> np.ndarray | None:
+        """(21, 3) MediaPipe landmarks -> joint angles, or None if invalid."""
+        if self._retargeter is None:
+            return None
         if np.allclose(mediapipe_pts, 0):
             return None
         return self._retargeter.retarget(mediapipe_pts)

@@ -47,9 +47,7 @@ def solve_pose_ik(
     max_iters: int = 30,
     tol: float = 1e-4,
     rot_weight: float = 1.0,
-    home_qpos: np.ndarray | None = np.array(
-        [0.0, 0.9, -0.9, 0.0, 0.4, 0.0, 0.0, 0.0], dtype=np.float64
-    ),
+    home_qpos: np.ndarray | None = None,
     home_weight: float = 0.01,
     current_q_weight: float = 0.0,
     skip_tail_joints: int = 2,

@@ -37,59 +37,46 @@ VP_TO_MEDIAPIPE = (
 #   Robot Y = -AVP X   (left)
 #   Robot Z =  AVP Z   (up)
 
-_RZ = np.array(
+# AVP Z-up → Robot frame: Rz(-90°)
+#   AVP frame:  X=right, Y=forward, Z=up
+#   Robot frame: X=forward, Y=left, Z=up
+#   Robot X =  AVP Y,  Robot Y = -AVP X,  Robot Z = AVP Z
+_AVP_TO_ROBOT = np.array(
     [[ 0.0, 1.0, 0.0],
      [-1.0, 0.0, 0.0],
      [ 0.0, 0.0, 1.0]],
     dtype=np.float64,
 )
-
-_RZ_T = _RZ.T
+_AVP_TO_ROBOT_T = _AVP_TO_ROBOT.T
 
 
 def transform_avp_to_robot_pose(
     avp_pos: np.ndarray,
     avp_rot: np.ndarray,
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
-    """Convert AVP Z-up wrist pose to robot frame.
-
-    Args:
-        avp_pos: (3,) position in AVP Z-up frame.
-        avp_rot: (3, 3) rotation matrix in AVP Z-up frame.
-
-    Returns:
-        (robot_position, robot_quaternion) as tuples, matching the output
-        format of ``quaternion.transform_vr_to_robot_pose()``.
-    """
-    robot_pos = _RZ @ avp_pos
-    robot_rot = _RZ @ avp_rot @ _RZ_T
+    """Convert AVP Z-up wrist pose to robot frame."""
+    robot_pos = _AVP_TO_ROBOT @ avp_pos
+    robot_rot = _AVP_TO_ROBOT @ avp_rot @ _AVP_TO_ROBOT_T
     robot_quat = matrix_to_quaternion(
         tuple(tuple(float(v) for v in row) for row in robot_rot)
     )
     return (float(robot_pos[0]), float(robot_pos[1]), float(robot_pos[2])), robot_quat
 
 
-# Extra Rz(+90°) clockwise correction for real Kinova
-_RZ_CW = np.array(
-    [[ 0.0, 1.0, 0.0],
-     [-1.0, 0.0, 0.0],
-     [ 0.0, 0.0, 1.0]],
-    dtype=np.float64,
-)
-_RZ_CW_T = _RZ_CW.T
-
-
-def apply_rz90cw(
+def apply_real_kinova_base_correction(
     pos: Tuple[float, float, float],
     quat: Tuple[float, float, float, float],
 ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
-    """Apply an additional Rz(+90°) clockwise rotation on top of existing pose."""
+    """Apply an additional Rz(-90°) for real Kinova base offset (q0=90°).
+
+    The real Kinova's _INIT_QPOS[0]=90° means the base is already rotated
+    relative to the MuJoCo model. This extra transform accounts for that offset.
+    """
     p = np.array(pos, dtype=np.float64)
-    rp = _RZ_CW @ p
-    # Reconstruct rotation matrix from quaternion, rotate, convert back
+    rp = _AVP_TO_ROBOT @ p
     from util.quaternion import quaternion_to_matrix
     rot = np.array(quaternion_to_matrix(quat), dtype=np.float64)
-    rr = _RZ_CW @ rot @ _RZ_CW_T
+    rr = _AVP_TO_ROBOT @ rot @ _AVP_TO_ROBOT_T
     rq = matrix_to_quaternion(
         tuple(tuple(float(v) for v in row) for row in rr)
     )
@@ -141,29 +128,6 @@ class AVPInput:
         pos = np.asarray(wrist_mat[:3, 3], dtype=np.float64)
         rot = np.asarray(wrist_mat[:3, :3], dtype=np.float64)
         return transform_avp_to_robot_pose(pos, rot)
-
-    def get_wrist_pose_raw(
-        self, side: str = "right"
-    ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
-        """Extract wrist (position, quaternion) in AVP Z-up frame directly.
-
-        No additional rotation applied. For real robot where the base frame
-        aligns with AVP Z-up without the Rz(-90) correction.
-        """
-        if self._latest is None:
-            return None
-        hand = self._latest.right if side == "right" else self._latest.left
-        if hand is None:
-            return None
-        wrist_mat = hand.wrist
-        if wrist_mat is None:
-            return None
-        pos = wrist_mat[:3, 3]
-        rot = wrist_mat[:3, :3]
-        quat = matrix_to_quaternion(
-            tuple(tuple(float(v) for v in row) for row in rot)
-        )
-        return (float(pos[0]), float(pos[1]), float(pos[2])), quat
 
     # -- hand landmarks -----------------------------------------------------
 

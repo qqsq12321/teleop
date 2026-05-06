@@ -24,6 +24,7 @@ def main() -> None:
     home_key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if home_key_id != -1:
         mujoco.mj_resetDataKeyframe(model, data, home_key_id)
+        data.ctrl[:model.nu] = data.qpos[:model.nu]
     else:
         desired_qpos = [0.0, 0.9, -0.9, 0.0, 0.4, 0.0, 0.0]
         if model.nq >= len(desired_qpos):
